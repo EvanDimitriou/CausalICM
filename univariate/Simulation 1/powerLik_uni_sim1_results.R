@@ -1,0 +1,192 @@
+# ============================================================
+# 0. Libraries
+# ============================================================
+
+if (!requireNamespace("mvtnorm", quietly = TRUE)) install.packages("mvtnorm")
+if (!requireNamespace("loo", quietly = TRUE)) install.packages("loo")
+library(mvtnorm)
+library(loo)
+library(ManyData)
+library(causl)
+library(data.table)
+library(ggplot2)
+
+set.seed(42)
+
+# ============================================================
+# 1. Load dataset
+# ============================================================
+
+all_data <- read.csv("datasets_sim1.csv")  # generic path
+head(all_data)
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+merge_formulas <- function(formulas) {
+  list(formula = formulas[[1]], wh = list(beta = TRUE, phi = TRUE))
+}
+
+masks <- function(formulas, family, wh) {
+  beta_names <- names(coef(lm(formulas[[1]], data = dat_e)))
+  list(beta_m = setNames(rep(1, length(beta_names)), beta_names), phi_m = 1)
+}
+
+nll2 <- function(theta, dat, mm = NULL, mask_beta, mask_phi, seqphi, fam_cop,
+                 family, link, useC) {
+  X <- model.matrix(Y ~ A * poly(X, 2, raw = TRUE), data = dat)
+  beta <- theta[1:ncol(X)]
+  mu <- as.vector(X %*% beta)
+  -sum(dnorm(dat$Y, mu, 1, log = TRUE))
+}
+
+lhs <- function(formulas) c("Y")
+
+llC <- function(y, mm, beta_m, phi, inCop) {
+  mu <- as.vector(mm %*% beta_m)
+  dnorm(y, mu, 1, log = TRUE)
+}
+
+ApproxFI_single <- function(msk, theta, mm, dat, delta) diag(length(theta))
+
+ManyData <- list2env(list(ApproxFI_single = ApproxFI_single, llC = llC))
+causl <- list2env(list(nll2 = nll2, lhs = lhs))
+
+# ============================================================
+# 3. Compute ELPD (WAIC)
+# ============================================================
+
+compute_elpd <- function(dat_e, dat_o, eta, mcmc_pars) {
+  formulas <- list(Y ~ A * poly(X, 2, raw = TRUE), ~ A * poly(X, 2, raw = TRUE), ~ 1)
+  family <- list(gaussian(), binomial(), gaussian())
+  
+  start <- rep(0, ncol(model.matrix(Y ~ A * poly(X, 2, raw = TRUE), data = dat_e)))
+  
+  msks <- list(
+    obs = masks(formulas[-2], family[-2], NULL),
+    exp = masks(formulas[-2], family[-2], NULL)
+  )
+  
+  theta_curr <- start
+  prop_sigma <- diag(length(start)) * 0.01  # simple proposal covariance
+  
+  chain <- matrix(NA, nrow = (mcmc_pars$n_iter - mcmc_pars$n_burn) / mcmc_pars$n_thin, ncol = length(start))
+  rec <- 0
+  
+  curr_ll <- -causl$nll2(theta_curr, dat_e, NULL, msks$exp$beta_m, msks$exp$phi_m, NULL, 1, family, NULL, TRUE) +
+    -eta * causl$nll2(theta_curr, dat_o, NULL, msks$obs$beta_m, msks$obs$phi_m, NULL, 1, family, NULL, TRUE)
+  
+  for (i in seq_len(mcmc_pars$n_iter)) {
+    theta_prop <- theta_curr + mvtnorm::rmvnorm(1, sigma = prop_sigma)
+    prop_ll <- -causl$nll2(theta_prop, dat_e, NULL, msks$exp$beta_m, msks$exp$phi_m, NULL, 1, family, NULL, TRUE) +
+      -eta * causl$nll2(theta_prop, dat_o, NULL, msks$obs$beta_m, msks$obs$phi_m, NULL, 1, family, NULL, TRUE)
+    
+    if (-rexp(1) < (prop_ll - curr_ll)) {
+      theta_curr <- theta_prop
+      curr_ll <- prop_ll
+    }
+    
+    if (i > mcmc_pars$n_burn && ((i - mcmc_pars$n_burn - 1) %% mcmc_pars$n_thin == 0)) {
+      rec <- rec + 1
+      chain[rec, ] <- theta_curr
+    }
+  }
+  
+  # Compute WAIC
+  mm_exp <- model.matrix(formulas[[1]], data = dat_e)
+  out <- sapply(1:nrow(chain), function(i) ManyData$llC(dat_e[, lhs(formulas)[1]], mm_exp, chain[i, ], 1, NULL))
+  waic_eta <- loo::waic(out)
+  
+  waic_eta$estimates["elpd_waic", "Estimate"]
+}
+
+# ============================================================
+# 4. Loop over datasets and eta values
+# ============================================================
+
+mcmc_pars <- list(n_iter = 50, n_burn = 10, n_thin = 2)
+eta_grid <- seq(0, 1, by = 0.2)
+dataset_ids <- sort(unique(all_data$datasetNo))
+
+results <- data.frame(eta = eta_grid, elpd_mean = NA_real_, elpd_sd = NA_real_)
+
+for (eta in eta_grid) {
+  elpds <- c()
+  for (d in dataset_ids) {
+    dat_d <- subset(all_data, datasetNo == d)
+    dat_e <- subset(dat_d, S == 1)
+    dat_o <- subset(dat_d, S == 0)
+    elpds <- c(elpds, compute_elpd(dat_e, dat_o, eta, mcmc_pars))
+  }
+  results$elpd_mean[results$eta == eta] <- mean(elpds)
+  results$elpd_sd[results$eta == eta] <- sd(elpds) / sqrt(length(elpds))
+}
+
+# Plot
+ggplot(results, aes(x = eta, y = elpd_mean)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_errorbar(aes(ymin = elpd_mean - elpd_sd, ymax = elpd_mean + elpd_sd), width = 0.05) +
+  labs(x = expression(eta), y = "Average ELPD (WAIC)",
+       title = "Average ELPD vs Eta across datasets") +
+  theme_minimal()
+
+eta_optim <- results$eta[which.max(results$elpd_mean)]
+
+# ============================================================
+# 5. Approximate posterior & CATE estimation
+# ============================================================
+
+approx_posterior <- function(fit_exp, fit_obs, eta, n_sample) {
+  theta_hat <- fit_exp$par + eta * (fit_obs$par - fit_exp$par)
+  FI <- fit_exp$sandwich + eta * fit_obs$sandwich
+  invFI <- tryCatch(solve(FI), error = function(e) MASS::ginv(FI))
+  
+  samples <- MASS::mvrnorm(n = n_sample, mu = theta_hat, Sigma = invFI)
+  colnames(samples) <- names(theta_hat)
+  samples
+}
+
+n_sample <- 2000
+x_grid <- seq(-2, 2, length.out = 50)
+tau_true <- function(x) 1 + x
+
+datasets <- unique(all_data$datasetNo)
+rmse_list <- numeric(length(datasets))
+cate_estimates <- list()
+beta_means <- vector("list", length(datasets))
+
+for (i in seq_along(datasets)) {
+  dat_i <- all_data[all_data$datasetNo == datasets[i], ]
+  exp_data <- dat_i[dat_i$S == 1, ]
+  obs_data <- dat_i[dat_i$S == 0, ]
+  
+  # Fit models
+  fit_exp <- fit_causl(dat = exp_data, formulas = list(Y ~ A * (X + I(X^2))), family = list(1))
+  fit_obs <- fit_causl(dat = obs_data, formulas = list(Y ~ A * (X + I(X^2))), family = list(1))
+  
+  # Posterior
+  samples <- approx_posterior(fit_exp, fit_obs, eta_optim, n_sample)
+  posterior_means <- colMeans(samples)
+  beta_means[[i]] <- posterior_means[c("beta_A", "beta_AX", "beta_AX2")]
+  
+  # Estimated CATE
+  CATE_est <- posterior_means["beta_A"] + posterior_means["beta_AX"] * x_grid + posterior_means["beta_AX2"] * x_grid^2
+  CATE_true <- tau_true(x_grid)
+  rmse_list[i] <- sqrt(mean((CATE_est - CATE_true)^2))
+  
+  cate_estimates[[i]] <- data.table(dataset = datasets[i], x = x_grid, CATE_est = CATE_est, CATE_true = CATE_true)
+}
+
+# Summary
+mean_rmse <- mean(rmse_list)
+sd_rmse <- sd(rmse_list)
+
+cat("Average RMSE:", mean_rmse, "SD:", sd_rmse, "\n")
+
+
+# Save results
+saveRDS(list(eta = eta_optim, rmse_list = rmse_list, mean_rmse = mean_rmse, sd_rmse = sd_rmse,
+             betas_list = beta_means), file = "cate_rmse_results_sim1.rds")
+saveRDS(cate_estimates, file = "cate_estimates_sim1.rds")
